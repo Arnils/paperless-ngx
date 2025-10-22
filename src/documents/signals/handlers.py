@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import ipaddress
 import logging
 import shutil
+import socket
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import urlparse
 
 import httpx
 from celery import shared_task
@@ -68,7 +71,7 @@ def add_inbox_tags(sender, document: Document, logging_group=None, **kwargs):
     else:
         tags = Tag.objects.all()
     inbox_tags = tags.filter(is_inbox_tag=True)
-    document.tags.add(*inbox_tags)
+    document.add_nested_tags(inbox_tags)
 
 
 def _suggestion_printer(
@@ -257,7 +260,7 @@ def set_tags(
             extra={"group": logging_group},
         )
 
-        document.tags.add(*relevant_tags)
+        document.add_nested_tags(relevant_tags)
 
 
 def set_storage_path(
@@ -660,6 +663,28 @@ def run_workflows_updated(sender, document: Document, logging_group=None, **kwar
     )
 
 
+def _is_public_ip(ip: str) -> bool:
+    try:
+        obj = ipaddress.ip_address(ip)
+        return not (
+            obj.is_private
+            or obj.is_loopback
+            or obj.is_link_local
+            or obj.is_multicast
+            or obj.is_unspecified
+        )
+    except ValueError:  # pragma: no cover
+        return False
+
+
+def _resolve_first_ip(host: str) -> str | None:
+    try:
+        info = socket.getaddrinfo(host, None)
+        return info[0][4][0] if info else None
+    except Exception:  # pragma: no cover
+        return None
+
+
 @shared_task(
     retry_backoff=True,
     autoretry_for=(httpx.HTTPStatusError,),
@@ -674,11 +699,35 @@ def send_webhook(
     *,
     as_json: bool = False,
 ):
+    p = urlparse(url)
+    if p.scheme.lower() not in settings.WEBHOOKS_ALLOWED_SCHEMES or not p.hostname:
+        logger.warning("Webhook blocked: invalid scheme/hostname")
+        raise ValueError("Invalid URL scheme or hostname.")
+
+    port = p.port or (443 if p.scheme == "https" else 80)
+    if (
+        len(settings.WEBHOOKS_ALLOWED_PORTS) > 0
+        and port not in settings.WEBHOOKS_ALLOWED_PORTS
+    ):
+        logger.warning("Webhook blocked: port not permitted")
+        raise ValueError("Destination port not permitted.")
+
+    ip = _resolve_first_ip(p.hostname)
+    if not ip or (
+        not _is_public_ip(ip) and not settings.WEBHOOKS_ALLOW_INTERNAL_REQUESTS
+    ):
+        logger.warning("Webhook blocked: destination not allowed")
+        raise ValueError("Destination host is not allowed.")
+
     try:
         post_args = {
             "url": url,
-            "headers": headers,
-            "files": files,
+            "headers": {
+                k: v for k, v in (headers or {}).items() if k.lower() != "host"
+            },
+            "files": files or None,
+            "timeout": 5.0,
+            "follow_redirects": False,
         }
         if as_json:
             post_args["json"] = data
@@ -690,15 +739,6 @@ def send_webhook(
         httpx.post(
             **post_args,
         ).raise_for_status()
-        logger.info(
-            f"Webhook sent to {url}",
-        )
-    except Exception as e:
-        logger.error(
-            f"Failed attempt sending webhook to {url}: {e}",
-        )
-        raise e
-
         logger.info(
             f"Webhook sent to {url}",
         )
@@ -727,14 +767,17 @@ def run_workflows(
 
     def assignment_action():
         if action.assign_tags.exists():
+            tag_ids_to_add: set[int] = set()
+            for tag in action.assign_tags.all():
+                tag_ids_to_add.add(tag.pk)
+                tag_ids_to_add.update(int(pk) for pk in tag.get_ancestors_pks())
+
             if not use_overrides:
-                doc_tag_ids.extend(action.assign_tags.values_list("pk", flat=True))
+                doc_tag_ids[:] = list(set(doc_tag_ids) | tag_ids_to_add)
             else:
                 if overrides.tag_ids is None:
                     overrides.tag_ids = []
-                overrides.tag_ids.extend(
-                    action.assign_tags.values_list("pk", flat=True),
-                )
+                overrides.tag_ids = list(set(overrides.tag_ids) | tag_ids_to_add)
 
         if action.assign_correspondent:
             if not use_overrides:
@@ -877,14 +920,17 @@ def run_workflows(
             else:
                 overrides.tag_ids = None
         else:
+            tag_ids_to_remove: set[int] = set()
+            for tag in action.remove_tags.all():
+                tag_ids_to_remove.add(tag.pk)
+                tag_ids_to_remove.update(int(pk) for pk in tag.get_descendants_pks())
+
             if not use_overrides:
-                for tag in action.remove_tags.filter(
-                    pk__in=document.tags.values_list("pk", flat=True),
-                ):
-                    doc_tag_ids.remove(tag.pk)
+                doc_tag_ids[:] = [t for t in doc_tag_ids if t not in tag_ids_to_remove]
             elif overrides.tag_ids:
-                for tag in action.remove_tags.filter(pk__in=overrides.tag_ids):
-                    overrides.tag_ids.remove(tag.pk)
+                overrides.tag_ids = [
+                    t for t in overrides.tag_ids if t not in tag_ids_to_remove
+                ]
 
         if not use_overrides and (
             action.remove_all_correspondents
@@ -1116,12 +1162,15 @@ def run_workflows(
             else ""
         )
         try:
+            attachments = []
+            if action.email.include_document and original_file:
+                attachments = [document]
             n_messages = send_email(
                 subject=subject,
                 body=body,
                 to=action.email.to.split(","),
-                attachment=original_file if action.email.include_document else None,
-                attachment_mime_type=document.mime_type,
+                attachments=attachments,
+                use_archive=False,
             )
             logger.debug(
                 f"Sent {n_messages} notification email(s) to {action.email.to}",

@@ -4,6 +4,7 @@ import tempfile
 from pathlib import Path
 from unittest import mock
 
+import pytest
 from auditlog.context import disable_auditlog
 from django.conf import settings
 from django.contrib.auth.models import User
@@ -22,6 +23,7 @@ from documents.models import Document
 from documents.models import DocumentType
 from documents.models import StoragePath
 from documents.tasks import empty_trash
+from documents.tests.factories import DocumentFactory
 from documents.tests.utils import DirectoriesMixin
 from documents.tests.utils import FileSystemAssertsMixin
 
@@ -1586,3 +1588,43 @@ class TestFilenameGeneration(DirectoriesMixin, TestCase):
                 generate_filename(doc),
                 Path("brussels-belgium/some-title-with-special-characters.pdf"),
             )
+
+
+class TestPathDateLocalization:
+    """
+    Groups all tests related to the `localize_date` function.
+    """
+
+    TEST_DATE = datetime.date(2023, 10, 26)
+
+    @pytest.mark.django_db
+    @pytest.mark.parametrize(
+        "filename_format,expected_filename",
+        [
+            pytest.param(
+                "{{title}}_{{ document.created | localize_date('MMMM', 'es_ES')}}",
+                "My Document_octubre.pdf",
+                id="spanish_month_name",
+            ),
+            pytest.param(
+                "{{title}}_{{ document.created | localize_date('EEEE', 'fr_FR')}}",
+                "My Document_jeudi.pdf",
+                id="french_day_of_week",
+            ),
+            pytest.param(
+                "{{title}}_{{ document.created | localize_date('dd/MM/yyyy', 'en_GB')}}",
+                "My Document_26/10/2023.pdf",
+                id="uk_date_format",
+            ),
+        ],
+    )
+    def test_localize_date_path_building(self, filename_format, expected_filename):
+        document = DocumentFactory.create(
+            title="My Document",
+            mime_type="application/pdf",
+            storage_type=Document.STORAGE_TYPE_UNENCRYPTED,
+            created=self.TEST_DATE,  # 2023-10-26 (which is a Thursday)
+        )
+        with override_settings(FILENAME_FORMAT=filename_format):
+            filename = generate_filename(document)
+            assert filename == Path(expected_filename)

@@ -17,8 +17,6 @@ from dateparser.languages.loader import LocaleDataLoader
 from django.utils.translation import gettext_lazy as _
 from dotenv import load_dotenv
 
-from paperless.utils import ocr_to_dateparser_languages
-
 logger = logging.getLogger("paperless.settings")
 
 # Tap paperless.conf if it's available
@@ -336,6 +334,7 @@ INSTALLED_APPS = [
     "allauth.mfa",
     "drf_spectacular",
     "drf_spectacular_sidecar",
+    "treenode",
     *env_apps,
 ]
 
@@ -681,7 +680,7 @@ def _parse_db_settings() -> dict:
     databases = {
         "default": {
             "ENGINE": "django.db.backends.sqlite3",
-            "NAME": str(DATA_DIR / "db.sqlite3"),
+            "NAME": DATA_DIR / "db.sqlite3",
             "OPTIONS": {},
         },
     }
@@ -809,7 +808,7 @@ LANGUAGES = [
     ("zh-tw", _("Chinese Traditional")),
 ]
 
-LOCALE_PATHS = [str(BASE_DIR / "locale")]
+LOCALE_PATHS = [BASE_DIR / "locale"]
 
 TIME_ZONE = os.getenv("PAPERLESS_TIME_ZONE", "UTC")
 
@@ -850,21 +849,21 @@ LOGGING = {
         "file_paperless": {
             "class": "concurrent_log_handler.ConcurrentRotatingFileHandler",
             "formatter": "verbose",
-            "filename": str(LOGGING_DIR / "paperless.log"),
+            "filename": LOGGING_DIR / "paperless.log",
             "maxBytes": LOGROTATE_MAX_SIZE,
             "backupCount": LOGROTATE_MAX_BACKUPS,
         },
         "file_mail": {
             "class": "concurrent_log_handler.ConcurrentRotatingFileHandler",
             "formatter": "verbose",
-            "filename": str(LOGGING_DIR / "mail.log"),
+            "filename": LOGGING_DIR / "mail.log",
             "maxBytes": LOGROTATE_MAX_SIZE,
             "backupCount": LOGROTATE_MAX_BACKUPS,
         },
         "file_celery": {
             "class": "concurrent_log_handler.ConcurrentRotatingFileHandler",
             "formatter": "verbose",
-            "filename": str(LOGGING_DIR / "celery.log"),
+            "filename": LOGGING_DIR / "celery.log",
             "maxBytes": LOGROTATE_MAX_SIZE,
             "backupCount": LOGROTATE_MAX_BACKUPS,
         },
@@ -1004,6 +1003,18 @@ THREADS_PER_WORKER = os.getenv(
 # Paperless Specific Settings                                                 #
 ###############################################################################
 
+IGNORABLE_FILES: Final[list[str]] = [
+    ".DS_Store",
+    ".DS_STORE",
+    "._*",
+    ".stfolder/*",
+    ".stversions/*",
+    ".localized/*",
+    "desktop.ini",
+    "@eaDir/*",
+    "Thumbs.db",
+]
+
 CONSUMER_POLLING = int(os.getenv("PAPERLESS_CONSUMER_POLLING", 0))
 
 CONSUMER_POLLING_DELAY = int(os.getenv("PAPERLESS_CONSUMER_POLLING_DELAY", 5))
@@ -1026,7 +1037,7 @@ CONSUMER_IGNORE_PATTERNS = list(
     json.loads(
         os.getenv(
             "PAPERLESS_CONSUMER_IGNORE_PATTERNS",
-            '[".DS_Store", ".DS_STORE", "._*", ".stfolder/*", ".stversions/*", ".localized/*", "desktop.ini", "@eaDir/*", "Thumbs.db"]',
+            json.dumps(IGNORABLE_FILES),
         ),
     ),
 )
@@ -1184,61 +1195,6 @@ DATE_ORDER = os.getenv("PAPERLESS_DATE_ORDER", "DMY")
 FILENAME_DATE_ORDER = os.getenv("PAPERLESS_FILENAME_DATE_ORDER")
 
 
-def _ocr_to_dateparser_languages(ocr_languages: str) -> list[str]:
-    """
-    Convert Tesseract OCR_LANGUAGE codes (ISO 639-2, e.g. "eng+fra", with optional scripts like "aze_Cyrl")
-    into a list of locales compatible with the `dateparser` library.
-
-    - If a script is provided (e.g., "aze_Cyrl"), attempts to use the full locale (e.g., "az-Cyrl").
-    Falls back to the base language (e.g., "az") if needed.
-    - If a language cannot be mapped or validated, it is skipped with a warning.
-    - Returns a list of valid locales, or an empty list if none could be converted.
-    """
-    ocr_to_dateparser = ocr_to_dateparser_languages()
-    loader = LocaleDataLoader()
-    result = []
-    try:
-        for ocr_language in ocr_languages.split("+"):
-            # Split into language and optional script
-            ocr_lang_part, *script = ocr_language.split("_")
-            ocr_script_part = script[0] if script else None
-
-            language_part = ocr_to_dateparser.get(ocr_lang_part)
-            if language_part is None:
-                logger.warning(
-                    f'Skipping unknown OCR language "{ocr_language}" — no dateparser equivalent.',
-                )
-                continue
-
-            # Ensure base language is supported by dateparser
-            loader.get_locale_map(locales=[language_part])
-
-            # Try to add the script part if it's supported by dateparser
-            if ocr_script_part:
-                dateparser_language = f"{language_part}-{ocr_script_part.title()}"
-                try:
-                    loader.get_locale_map(locales=[dateparser_language])
-                except Exception:
-                    logger.warning(
-                        f"Language variant '{dateparser_language}' not supported by dateparser; falling back to base language '{language_part}'. You can manually set PAPERLESS_DATE_PARSER_LANGUAGES if needed.",
-                    )
-                    dateparser_language = language_part
-            else:
-                dateparser_language = language_part
-            if dateparser_language not in result:
-                result.append(dateparser_language)
-    except Exception as e:
-        logger.warning(
-            f"Could not configure dateparser languages. Set PAPERLESS_DATE_PARSER_LANGUAGES parameter to avoid this. Detail: {e}",
-        )
-        return []
-    if not result:
-        logger.warning(
-            "Could not configure any dateparser languages from OCR_LANGUAGE — fallback to autodetection.",
-        )
-    return result
-
-
 def _parse_dateparser_languages(languages: str | None):
     language_list = languages.split("+") if languages else []
     # There is an unfixed issue in zh-Hant and zh-Hans locales in the dateparser lib.
@@ -1253,12 +1209,14 @@ def _parse_dateparser_languages(languages: str | None):
     return list(LocaleDataLoader().get_locale_map(locales=language_list))
 
 
-if os.getenv("PAPERLESS_DATE_PARSER_LANGUAGES"):
-    DATE_PARSER_LANGUAGES = _parse_dateparser_languages(
+# If not set, we will infer it at runtime
+DATE_PARSER_LANGUAGES = (
+    _parse_dateparser_languages(
         os.getenv("PAPERLESS_DATE_PARSER_LANGUAGES"),
     )
-else:
-    DATE_PARSER_LANGUAGES = _ocr_to_dateparser_languages(OCR_LANGUAGE)
+    if os.getenv("PAPERLESS_DATE_PARSER_LANGUAGES")
+    else None
+)
 
 
 # Maximum number of dates taken from document start to end to show as suggestions for
@@ -1420,4 +1378,26 @@ OUTLOOK_OAUTH_ENABLED = bool(
     (OAUTH_CALLBACK_BASE_URL or PAPERLESS_URL)
     and OUTLOOK_OAUTH_CLIENT_ID
     and OUTLOOK_OAUTH_CLIENT_SECRET,
+)
+
+###############################################################################
+# Webhooks
+###############################################################################
+WEBHOOKS_ALLOWED_SCHEMES = set(
+    s.lower()
+    for s in __get_list(
+        "PAPERLESS_WEBHOOKS_ALLOWED_SCHEMES",
+        ["http", "https"],
+    )
+)
+WEBHOOKS_ALLOWED_PORTS = set(
+    int(p)
+    for p in __get_list(
+        "PAPERLESS_WEBHOOKS_ALLOWED_PORTS",
+        [],
+    )
+)
+WEBHOOKS_ALLOW_INTERNAL_REQUESTS = __get_boolean(
+    "PAPERLESS_WEBHOOKS_ALLOW_INTERNAL_REQUESTS",
+    "true",
 )

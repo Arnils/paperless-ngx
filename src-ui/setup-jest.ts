@@ -121,8 +121,38 @@ if (!URL.revokeObjectURL) {
 }
 Object.defineProperty(window, 'ResizeObserver', { value: mock() })
 
+if (typeof IntersectionObserver === 'undefined') {
+  class MockIntersectionObserver {
+    constructor(
+      public callback: IntersectionObserverCallback,
+      public options?: IntersectionObserverInit
+    ) {}
+
+    observe = jest.fn()
+    unobserve = jest.fn()
+    disconnect = jest.fn()
+    takeRecords = jest.fn()
+  }
+
+  Object.defineProperty(window, 'IntersectionObserver', {
+    writable: true,
+    configurable: true,
+    value: MockIntersectionObserver,
+  })
+}
+
 HTMLCanvasElement.prototype.getContext = <
   typeof HTMLCanvasElement.prototype.getContext
 >jest.fn()
+
+jest.mock('uuid', () => ({
+  v4: jest.fn(() =>
+    'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (char: string) => {
+      const random = Math.floor(Math.random() * 16)
+      const value = char === 'x' ? random : (random & 0x3) | 0x8
+      return value.toString(16)
+    })
+  ),
+}))
 
 jest.mock('pdfjs-dist')

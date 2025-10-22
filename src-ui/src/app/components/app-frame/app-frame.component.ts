@@ -145,7 +145,7 @@ export class AppFrameComponent
   }
 
   get versionString(): string {
-    return `${environment.appTitle} v${this.settingsService.get(SETTINGS_KEYS.VERSION)}${environment.production ? '' : ` #${environment.tag}`}`
+    return `${environment.appTitle} v${this.settingsService.get(SETTINGS_KEYS.VERSION)}${environment.tag === 'prod' ? '' : ` #${environment.tag}`}`
   }
 
   get customAppTitle(): string {
@@ -287,6 +287,9 @@ export class AppFrameComponent
   }
 
   get showSidebarCounts(): boolean {
-    return this.settingsService.get(SETTINGS_KEYS.SIDEBAR_VIEWS_SHOW_COUNT)
+    return (
+      this.settingsService.get(SETTINGS_KEYS.SIDEBAR_VIEWS_SHOW_COUNT) &&
+      !this.settingsService.organizingSidebarSavedViews
+    )
   }
 }
